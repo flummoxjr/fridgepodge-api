@@ -11,9 +11,19 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // Fix DATABASE_URL if it contains newlines or spaces
-const DATABASE_URL = process.env.DATABASE_URL?.replace(/\s+/g, '') || 
-  'postgresql://fridge_podge_sql_user:PXisVbka1KQlP7n1MhAXJk6XwgTNL9xg@dpg-d1dgr1umcj7s73f90190-a.oregon-postgres.render.com/fridge_podge_sql';
+let DATABASE_URL = process.env.DATABASE_URL || '';
 
+// Remove ALL whitespace including newlines from the URL
+DATABASE_URL = DATABASE_URL.replace(/[\s\n\r]+/g, '');
+
+// If still broken or empty, use hardcoded URL
+if (!DATABASE_URL || DATABASE_URL.includes('dpg-d1dgr1umcj7s73f9019') && !DATABASE_URL.includes('dpg-d1dgr1umcj7s73f90190')) {
+  console.log('Using hardcoded DATABASE_URL due to corruption');
+  DATABASE_URL = 'postgresql://fridge_podge_sql_user:PXisVbka1KQlP7n1MhAXJk6XwgTNL9xg@dpg-d1dgr1umcj7s73f90190-a.oregon-postgres.render.com/fridge_podge_sql';
+}
+
+console.log('Database URL first 50 chars:', DATABASE_URL.substring(0, 50));
+console.log('Database URL last 50 chars:', DATABASE_URL.substring(DATABASE_URL.length - 50));
 console.log('Database URL length:', DATABASE_URL.length); // Should be 162 characters
 
 // PostgreSQL connection
@@ -26,6 +36,16 @@ const pool = new Pool({
 
 // In-memory cache (can be replaced with Redis)
 const cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 });
+
+// Test database connection on startup
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Database connection failed:', err.message);
+    console.error('Please check DATABASE_URL environment variable in Render dashboard');
+  } else {
+    console.log('Database connected successfully at:', res.rows[0].now);
+  }
+});
 
 // Trust proxy for Render deployment - specific to Render's proxy
 app.set('trust proxy', 1); // Trust first proxy only
