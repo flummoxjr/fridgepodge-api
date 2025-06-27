@@ -21,6 +21,9 @@ const pool = new Pool({
 // In-memory cache (can be replaced with Redis)
 const cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 });
 
+// Trust proxy for Render deployment
+app.set('trust proxy', true);
+
 // Middleware
 app.use(helmet());
 app.use(compression());
