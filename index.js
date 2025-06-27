@@ -21,8 +21,8 @@ const pool = new Pool({
 // In-memory cache (can be replaced with Redis)
 const cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 });
 
-// Trust proxy for Render deployment
-app.set('trust proxy', true);
+// Trust proxy for Render deployment - specific to Render's proxy
+app.set('trust proxy', 1); // Trust first proxy only
 
 // Middleware
 app.use(helmet());
@@ -33,7 +33,14 @@ app.use(express.json());
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  handler: (req, res) => {
+    res.status(429).json({
+      error: 'Too many requests, please try again later.'
+    });
+  }
 });
 app.use('/api/', limiter);
 
