@@ -332,8 +332,20 @@ app.post('/api/recipes/save-favorite', async (req, res) => {
       // Parse prep and cook times to minutes
       const parseTime = (timeStr) => {
         if (!timeStr) return 30;
-        const hours = timeStr.match(/(\d+)\s*h/i);
-        const minutes = timeStr.match(/(\d+)\s*m/i);
+        
+        // If it's already a number, just return it
+        if (typeof timeStr === 'number') return timeStr;
+        
+        // Convert to string to ensure we can use match
+        const str = String(timeStr);
+        
+        // If it's just a number as string, return it
+        const num = parseInt(str);
+        if (!isNaN(num) && str.trim() === num.toString()) return num;
+        
+        // Parse time strings like "30 minutes", "1 hour", etc.
+        const hours = str.match(/(\d+)\s*h/i);
+        const minutes = str.match(/(\d+)\s*m/i);
         let total = 0;
         if (hours) total += parseInt(hours[1]) * 60;
         if (minutes) total += parseInt(minutes[1]);
