@@ -44,15 +44,63 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// Helper function to parse ingredient strings
+function parseIngredient(ingredientStr) {
+  const measurementPattern = /^(\d+(?:\/\d+)?(?:\.\d+)?)\s*(cup|cups|tablespoon|tablespoons|tbsp|teaspoon|teaspoons|tsp|pound|pounds|lb|lbs|ounce|ounces|oz|gram|grams|g|kilogram|kilograms|kg|liter|liters|l|milliliter|milliliters|ml|piece|pieces|clove|cloves|can|cans|package|packages|bunch|bunches)?\s*(.+?)(?:,\s*(.+))?$/i;
+  
+  const match = ingredientStr.match(measurementPattern);
+  
+  if (match) {
+    return {
+      amount: parseFloat(match[1]),
+      unit: match[2] || 'unit',
+      name: match[3].trim(),
+      preparation: match[4] || null
+    };
+  }
+  
+  return {
+    amount: null,
+    unit: null,
+    name: ingredientStr.trim(),
+    preparation: null
+  };
+}
+
+// Extract core ingredient name (remove descriptors)
+function getCoreIngredient(ingredientName) {
+  const cleaned = ingredientName
+    .toLowerCase()
+    .replace(/\b(fresh|dried|frozen|canned|cooked|raw|whole|ground|minced|diced|chopped|sliced)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  
+  const mappings = {
+    'chicken breast': 'chicken',
+    'chicken thighs': 'chicken',
+    'chicken wings': 'chicken',
+    'ground beef': 'beef',
+    'beef steak': 'beef',
+    'white rice': 'rice',
+    'brown rice': 'rice',
+    'jasmine rice': 'rice',
+    'basmati rice': 'rice'
+  };
+  
+  return mappings[cleaned] || cleaned;
+}
+
 // Root route
 app.get('/', (req, res) => {
   res.json({ 
     service: 'FridgePodge Recipe API',
-    version: '1.0.0',
+    version: '1.1.0',
     status: 'running',
     endpoints: {
       health: '/health',
       recipeMatch: 'POST /api/recipes/match',
+      saveFavorite: 'POST /api/recipes/save-favorite',
+      popular: 'GET /api/recipes/popular',
       recipeById: 'GET /api/recipes/:id',
       rateRecipe: 'POST /api/recipes/:id/rate'
     }
@@ -73,8 +121,11 @@ app.post('/api/recipes/match', async (req, res) => {
       return res.status(400).json({ error: 'Ingredients array required' });
     }
 
+    // Extract core ingredients from user input
+    const coreIngredients = ingredients.map(ing => getCoreIngredient(ing.toLowerCase()));
+
     // Create cache key
-    const cacheKey = `match:${ingredients.sort().join(',')}:${dietary||''}:${cuisine||''}`;
+    const cacheKey = `match:${coreIngredients.sort().join(',')}:${dietary||''}:${cuisine||''}`;
     
     // Check cache first
     const cachedResult = cache.get(cacheKey);
@@ -93,7 +144,7 @@ app.post('/api/recipes/match', async (req, res) => {
       usedRecipeIds = usedRecipes.rows.map(r => r.recipe_id);
     }
 
-    // Build the matching query
+    // Simple matching query
     const matchQuery = `
       WITH user_ingredients AS (
         SELECT LOWER(unnest($1::text[])) as ingredient
@@ -107,49 +158,25 @@ app.post('/api/recipes/match', async (req, res) => {
           r.prep_time,
           r.cook_time,
           r.difficulty,
-          COUNT(DISTINCT CASE WHEN ri.is_required THEN i.id END) as required_count,
-          COUNT(DISTINCT CASE WHEN ri.is_required AND ui.ingredient IS NOT NULL THEN i.id END) as required_matched,
-          COUNT(DISTINCT CASE WHEN NOT ri.is_required AND ui.ingredient IS NOT NULL THEN i.id END) as optional_matched,
-          ARRAY_AGG(DISTINCT i.name) FILTER (WHERE ri.is_required) as required_ingredients,
-          COUNT(DISTINCT ui.ingredient) as user_ingredient_count
+          r.average_rating,
+          r.rating_count,
+          COUNT(DISTINCT i.id) as matched_ingredients,
+          COUNT(DISTINCT ri.ingredient_id) as total_ingredients
         FROM recipes r
         JOIN recipe_ingredients ri ON r.id = ri.recipe_id
         JOIN ingredients i ON ri.ingredient_id = i.id
-        LEFT JOIN ingredient_aliases ia ON i.id = ia.ingredient_id
-        LEFT JOIN user_ingredients ui ON (
-          LOWER(i.name) LIKE '%' || ui.ingredient || '%' OR
-          ui.ingredient LIKE '%' || LOWER(i.name) || '%' OR
-          LOWER(ia.alias) LIKE '%' || ui.ingredient || '%' OR
-          ui.ingredient LIKE '%' || LOWER(ia.alias) || '%'
-        )
-        WHERE ($2::text IS NULL OR r.cuisine = $2)
-          AND r.id != ALL($3::int[])
-        GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty
-      ),
-      scored_recipes AS (
-        SELECT 
-          *,
-          CASE 
-            WHEN required_count = 0 THEN 100.0
-            ELSE (required_matched::float / required_count::float) * 70
-          END +
-          (optional_matched::float * 5) +
-          CASE 
-            WHEN user_ingredient_count > 0 
-            THEN (required_matched + optional_matched)::float / user_ingredient_count::float * 30
-            ELSE 0
-          END as match_score
-        FROM recipe_matches
-        WHERE required_count = 0 OR (required_matched::float / required_count::float) >= 0.6
+        JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
+        WHERE r.id != ALL($2::int[])
+        GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count
+        HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
       )
-      SELECT * FROM scored_recipes
-      ORDER BY match_score DESC
+      SELECT * FROM recipe_matches
+      ORDER BY matched_ingredients DESC, average_rating DESC
       LIMIT 1;
     `;
 
     const result = await pool.query(matchQuery, [
-      ingredients.map(i => i.toLowerCase()),
-      cuisine || null,
+      coreIngredients,
       usedRecipeIds
     ]);
 
@@ -158,78 +185,269 @@ app.post('/api/recipes/match', async (req, res) => {
     }
 
     const recipe = result.rows[0];
-
+    
     // Get full recipe details
-    const [ingredientsResult, instructionsResult, nutritionResult, tagsResult] = await Promise.all([
-      pool.query(`
-        SELECT i.name, ri.amount, ri.unit, ri.is_required, ri.notes
-        FROM recipe_ingredients ri
-        JOIN ingredients i ON ri.ingredient_id = i.id
-        WHERE ri.recipe_id = $1
-        ORDER BY ri.is_required DESC, i.name
-      `, [recipe.id]),
-      
-      pool.query(`
-        SELECT step_number, instruction
-        FROM recipe_instructions
-        WHERE recipe_id = $1
-        ORDER BY step_number
-      `, [recipe.id]),
-      
-      pool.query(`
-        SELECT calories, protein, carbs, fat, fiber, sugar, sodium
-        FROM recipe_nutrition
-        WHERE recipe_id = $1
-      `, [recipe.id]),
-      
-      pool.query(`
-        SELECT dt.name
-        FROM recipe_dietary_tags rdt
-        JOIN dietary_tags dt ON rdt.dietary_tag_id = dt.id
-        WHERE rdt.recipe_id = $1
-      `, [recipe.id])
-    ]);
+    const ingredientsResult = await pool.query(
+      'SELECT i.name, ri.amount, ri.unit FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.id WHERE ri.recipe_id = $1',
+      [recipe.id]
+    );
+    
+    const instructionsResult = await pool.query(
+      'SELECT instruction FROM recipe_instructions WHERE recipe_id = $1 ORDER BY step_number',
+      [recipe.id]
+    );
+    
+    const nutritionResult = await pool.query(
+      'SELECT * FROM recipe_nutrition WHERE recipe_id = $1',
+      [recipe.id]
+    );
 
-    const fullRecipe = {
-      found: true,
-      recipe: {
-        id: recipe.id,
-        title: recipe.title,
-        cuisine: recipe.cuisine,
-        servings: recipe.servings,
-        prepTime: recipe.prep_time,
-        cookTime: recipe.cook_time,
-        difficulty: recipe.difficulty,
-        matchScore: recipe.match_score,
-        ingredients: ingredientsResult.rows.map(i => ({
-          name: i.name,
-          amount: i.amount,
-          unit: i.unit,
-          required: i.is_required,
-          notes: i.notes
-        })),
-        instructions: instructionsResult.rows.map(i => i.instruction),
-        nutrition: nutritionResult.rows[0] || null,
-        dietaryTags: tagsResult.rows.map(t => t.name)
-      }
+    // Format recipe for response
+    const formattedRecipe = {
+      id: recipe.id,
+      title: recipe.title,
+      cuisine: recipe.cuisine,
+      servings: recipe.servings,
+      prepTime: `${recipe.prep_time} minutes`,
+      cookTime: `${recipe.cook_time} minutes`,
+      difficulty: recipe.difficulty,
+      rating: recipe.average_rating,
+      ratingCount: recipe.rating_count,
+      ingredients: ingredientsResult.rows.map(ing => 
+        `${ing.amount} ${ing.unit} ${ing.name}`.trim()
+      ),
+      instructions: instructionsResult.rows.map(inst => inst.instruction),
+      nutrition: nutritionResult.rows[0] || null
     };
-
-    // Cache the result
-    cache.set(cacheKey, fullRecipe);
-
-    // Log usage
+    
+    // Record usage
     if (deviceId) {
-      pool.query(
+      await pool.query(
         'INSERT INTO recipe_usage (recipe_id, device_id) VALUES ($1, $2)',
         [recipe.id, deviceId]
-      ).catch(err => console.error('Failed to log usage:', err));
+      );
     }
-
-    res.json(fullRecipe);
-
+    
+    // Cache the result
+    const response = { found: true, recipe: formattedRecipe };
+    cache.set(cacheKey, response);
+    
+    res.json(response);
+    
   } catch (error) {
-    console.error('Recipe matching error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Error matching recipe:', error);
+    res.status(500).json({ error: 'Failed to match recipe' });
+  }
+});
+
+// Save favorite recipe endpoint (5-star recipes)
+app.post('/api/recipes/save-favorite', async (req, res) => {
+  try {
+    const { recipe, deviceId, rating } = req.body;
+    
+    // Validate input
+    if (!recipe || !recipe.title) {
+      return res.status(400).json({ error: 'Recipe title is required' });
+    }
+    
+    if (rating !== 5) {
+      return res.status(400).json({ error: 'Only 5-star recipes can be saved as favorites' });
+    }
+    
+    console.log(`Saving 5-star recipe: ${recipe.title}`);
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    try {
+      // Check if recipe already exists
+      const existingRecipe = await pool.query(
+        'SELECT id FROM recipes WHERE title = $1',
+        [recipe.title]
+      );
+      
+      if (existingRecipe.rows.length > 0) {
+        // Recipe exists, just update rating count
+        await pool.query(
+          'UPDATE recipes SET rating_count = rating_count + 1, average_rating = ((average_rating * rating_count) + $1) / (rating_count + 1) WHERE id = $2',
+          [rating, existingRecipe.rows[0].id]
+        );
+        
+        await pool.query('COMMIT');
+        return res.json({ 
+          success: true, 
+          message: 'Recipe rating updated',
+          recipeId: existingRecipe.rows[0].id 
+        });
+      }
+      
+      // Parse prep and cook times to minutes
+      const parseTime = (timeStr) => {
+        if (!timeStr) return 30;
+        const hours = timeStr.match(/(\d+)\s*h/i);
+        const minutes = timeStr.match(/(\d+)\s*m/i);
+        let total = 0;
+        if (hours) total += parseInt(hours[1]) * 60;
+        if (minutes) total += parseInt(minutes[1]);
+        return total || 30;
+      };
+      
+      // Insert new recipe
+      const recipeResult = await pool.query(
+        `INSERT INTO recipes (
+          title, cuisine, servings, prep_time, cook_time, 
+          difficulty, source, average_rating, rating_count
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+        RETURNING id`,
+        [
+          recipe.title,
+          recipe.cuisine || 'american',
+          parseInt(recipe.servings) || 4,
+          parseTime(recipe.prepTime),
+          parseTime(recipe.cookTime),
+          recipe.difficulty || 'medium',
+          'user_generated',
+          5.0,
+          1
+        ]
+      );
+      
+      const recipeId = recipeResult.rows[0].id;
+      console.log(`Created recipe with ID: ${recipeId}`);
+      
+      // Insert parsed ingredients
+      if (recipe.ingredients && Array.isArray(recipe.ingredients)) {
+        for (const ingredientStr of recipe.ingredients) {
+          const parsed = parseIngredient(ingredientStr);
+          const coreIngredient = getCoreIngredient(parsed.name);
+          
+          // First, ensure core ingredient exists in ingredients table
+          let ingredientId;
+          const existingIngredient = await pool.query(
+            'SELECT id FROM ingredients WHERE LOWER(name) = LOWER($1)',
+            [coreIngredient]
+          );
+          
+          if (existingIngredient.rows.length > 0) {
+            ingredientId = existingIngredient.rows[0].id;
+          } else {
+            // Insert new ingredient
+            const newIngredient = await pool.query(
+              'INSERT INTO ingredients (name, category) VALUES ($1, $2) RETURNING id',
+              [coreIngredient, 'other']
+            );
+            ingredientId = newIngredient.rows[0].id;
+          }
+          
+          // Link ingredient to recipe
+          await pool.query(
+            'INSERT INTO recipe_ingredients (recipe_id, ingredient_id, amount, unit, is_required) VALUES ($1, $2, $3, $4, $5)',
+            [recipeId, ingredientId, parsed.amount || 1, parsed.unit || 'unit', true]
+          );
+        }
+      }
+      
+      // Insert instructions
+      if (recipe.instructions) {
+        if (Array.isArray(recipe.instructions)) {
+          for (let i = 0; i < recipe.instructions.length; i++) {
+            await pool.query(
+              'INSERT INTO recipe_instructions (recipe_id, step_number, instruction) VALUES ($1, $2, $3)',
+              [recipeId, i + 1, recipe.instructions[i]]
+            );
+          }
+        } else {
+          await pool.query(
+            'INSERT INTO recipe_instructions (recipe_id, step_number, instruction) VALUES ($1, $2, $3)',
+            [recipeId, 1, recipe.instructions]
+          );
+        }
+      }
+      
+      // Insert nutrition info if available
+      if (recipe.nutrition) {
+        const parseNutritionValue = (val) => {
+          if (!val) return 0;
+          const num = parseFloat(val.toString().replace(/[^\d.]/g, ''));
+          return isNaN(num) ? 0 : num;
+        };
+        
+        await pool.query(
+          `INSERT INTO recipe_nutrition (
+            recipe_id, calories, protein, carbs, fat, fiber
+          ) VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            recipeId,
+            parseNutritionValue(recipe.nutrition.calories),
+            parseNutritionValue(recipe.nutrition.protein),
+            parseNutritionValue(recipe.nutrition.carbs),
+            parseNutritionValue(recipe.nutrition.fat),
+            parseNutritionValue(recipe.nutrition.fiber)
+          ]
+        );
+      }
+      
+      // Record device submission
+      if (deviceId) {
+        await pool.query(
+          'INSERT INTO recipe_usage (recipe_id, device_id, rating) VALUES ($1, $2, $3)',
+          [recipeId, deviceId, rating]
+        );
+      }
+      
+      await pool.query('COMMIT');
+      
+      // Clear cache
+      cache.flushAll();
+      
+      console.log(`Recipe "${recipe.title}" saved successfully`);
+      
+      res.json({ 
+        success: true, 
+        message: 'Recipe saved and shared with community!',
+        recipeId: recipeId 
+      });
+      
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+    
+  } catch (error) {
+    console.error('Error saving recipe:', error);
+    res.status(500).json({ error: 'Failed to save recipe: ' + error.message });
+  }
+});
+
+// Get popular recipes endpoint
+app.get('/api/recipes/popular', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        r.id,
+        r.title,
+        r.cuisine,
+        r.servings,
+        r.prep_time,
+        r.cook_time,
+        r.difficulty,
+        r.average_rating,
+        r.rating_count
+      FROM recipes r
+      WHERE r.source = 'user_generated' 
+        AND r.average_rating >= 4.5
+        AND r.rating_count >= 1
+      ORDER BY r.average_rating DESC, r.rating_count DESC
+      LIMIT 20
+    `);
+    
+    res.json({
+      success: true,
+      recipes: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching popular recipes:', error);
+    res.status(500).json({ error: 'Failed to fetch popular recipes' });
   }
 });
 
@@ -238,17 +456,50 @@ app.get('/api/recipes/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    // Similar to above, get full recipe details
-    // ... (implementation similar to match endpoint)
+    const recipeResult = await pool.query(
+      'SELECT * FROM recipes WHERE id = $1',
+      [id]
+    );
     
-    res.json({ recipe: fullRecipe });
+    if (recipeResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Recipe not found' });
+    }
+    
+    const recipe = recipeResult.rows[0];
+    
+    // Get ingredients
+    const ingredientsResult = await pool.query(
+      'SELECT i.name, ri.amount, ri.unit FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.id WHERE ri.recipe_id = $1',
+      [id]
+    );
+    
+    // Get instructions
+    const instructionsResult = await pool.query(
+      'SELECT instruction FROM recipe_instructions WHERE recipe_id = $1 ORDER BY step_number',
+      [id]
+    );
+    
+    // Get nutrition
+    const nutritionResult = await pool.query(
+      'SELECT * FROM recipe_nutrition WHERE recipe_id = $1',
+      [id]
+    );
+    
+    res.json({
+      recipe: {
+        ...recipe,
+        ingredients: ingredientsResult.rows,
+        instructions: instructionsResult.rows.map(i => i.instruction),
+        nutrition: nutritionResult.rows[0] || null
+      }
+    });
   } catch (error) {
     console.error('Get recipe error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Rate a recipe
+// Rate recipe
 app.post('/api/recipes/:id/rate', async (req, res) => {
   try {
     const { id } = req.params;
