@@ -37,6 +37,21 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// Root route
+app.get('/', (req, res) => {
+  res.json({ 
+    service: 'FridgePodge Recipe API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      recipeMatch: 'POST /api/recipes/match',
+      recipeById: 'GET /api/recipes/:id',
+      rateRecipe: 'POST /api/recipes/:id/rate'
+    }
+  });
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
