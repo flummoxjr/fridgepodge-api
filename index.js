@@ -10,9 +10,15 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Fix DATABASE_URL if it contains newlines or spaces
+const DATABASE_URL = process.env.DATABASE_URL?.replace(/\s+/g, '') || 
+  'postgresql://fridge_podge_sql_user:PXisVbka1KQlP7n1MhAXJk6XwgTNL9xg@dpg-d1dgr1umcj7s73f90190-a.oregon-postgres.render.com/fridge_podge_sql';
+
+console.log('Database URL length:', DATABASE_URL.length); // Should be 162 characters
+
 // PostgreSQL connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: {
     rejectUnauthorized: false
   }
