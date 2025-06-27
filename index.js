@@ -138,6 +138,28 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Database health check
+app.get('/db-health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW() as time, COUNT(*) as tables FROM information_schema.tables WHERE table_schema = \'public\'');
+    res.json({ 
+      status: 'connected',
+      time: result.rows[0].time,
+      tables: result.rows[0].tables,
+      url_length: DATABASE_URL.length,
+      url_preview: DATABASE_URL.substring(0, 30) + '...' + DATABASE_URL.substring(DATABASE_URL.length - 30)
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error',
+      message: error.message,
+      hostname: error.hostname || 'unknown',
+      env_set: !!process.env.DATABASE_URL,
+      using_fallback: !process.env.DATABASE_URL || process.env.DATABASE_URL.includes('dpg-d1dgr1umcj7s73f9019')
+    });
+  }
+});
+
 // Recipe matching endpoint
 app.post('/api/recipes/match', async (req, res) => {
   try {
