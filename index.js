@@ -75,6 +75,10 @@ async function initializeDatabaseTables() {
     await pool.query('ALTER TABLE recipes ADD COLUMN IF NOT EXISTS submitted_by VARCHAR(255)');
     console.log('✓ submitted_by column ready');
     
+    // Add rating column to recipe_views if it doesn't exist
+    await pool.query('ALTER TABLE recipe_views ADD COLUMN IF NOT EXISTS rating INTEGER CHECK (rating >= 1 AND rating <= 5)');
+    console.log('✓ rating column ready in recipe_views');
+    
     // Check current stats
     const stats = await pool.query(`
       SELECT 
@@ -699,6 +703,57 @@ app.get('/api/recipes/most-saved', async (req, res) => {
   }
 });
 
+// Get top community recipes (most 5-starred)
+app.get('/api/recipes/top-community', async (req, res) => {
+  try {
+    // Query to get top 10 recipes based on 5-star rating count
+    const topRecipesResult = await pool.query(`
+      SELECT 
+        r.id,
+        r.title,
+        r.servings,
+        r.cuisine,
+        r.prep_time,
+        r.cook_time,
+        COUNT(DISTINCT rv.device_id) FILTER (WHERE rv.rating = 5) as rating_count,
+        r.created_at
+      FROM recipes r
+      LEFT JOIN recipe_views rv ON r.id = rv.recipe_id
+      WHERE r.submitted_by IS NOT NULL  -- Only community-submitted recipes
+      GROUP BY r.id, r.title, r.servings, r.cuisine, r.prep_time, r.cook_time, r.created_at
+      HAVING COUNT(DISTINCT rv.device_id) FILTER (WHERE rv.rating = 5) > 0
+      ORDER BY rating_count DESC, r.created_at DESC
+      LIMIT 10
+    `);
+    
+    if (topRecipesResult.rows.length === 0) {
+      // If no community recipes with ratings, return most recent community recipes
+      const recentResult = await pool.query(`
+        SELECT 
+          r.id,
+          r.title,
+          r.servings,
+          r.cuisine,
+          r.prep_time,
+          r.cook_time,
+          0 as rating_count,
+          r.created_at
+        FROM recipes r
+        WHERE r.submitted_by IS NOT NULL
+        ORDER BY r.created_at DESC
+        LIMIT 10
+      `);
+      
+      return res.json(recentResult.rows);
+    }
+    
+    res.json(topRecipesResult.rows);
+  } catch (error) {
+    console.error('Get top community recipes error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get recipe by ID
 app.get('/api/recipes/:id', async (req, res) => {
   try {
@@ -733,14 +788,32 @@ app.get('/api/recipes/:id', async (req, res) => {
       [id]
     );
     
-    res.json({
-      recipe: {
-        ...recipe,
-        ingredients: ingredientsResult.rows,
-        instructions: instructionsResult.rows.map(i => i.instruction),
-        nutrition: nutritionResult.rows[0] || null
-      }
-    });
+    // Format the recipe to match frontend expectations
+    const formattedRecipe = {
+      id: recipe.id,
+      title: recipe.title,
+      description: recipe.description || `A delicious ${recipe.cuisine || 'homemade'} dish`,
+      ingredients: ingredientsResult.rows.map(ing => 
+        ing.amount ? `${ing.amount} ${ing.unit || ''} ${ing.name}`.trim() : ing.name
+      ),
+      instructions: instructionsResult.rows.map(i => i.instruction),
+      prepTime: recipe.prep_time ? `${recipe.prep_time} minutes` : '30 minutes',
+      cookTime: recipe.cook_time ? `${recipe.cook_time} minutes` : '30 minutes',
+      servings: recipe.servings || 4,
+      nutrition: nutritionResult.rows[0] || {
+        calories: 450,
+        protein: 25,
+        carbs: 50,
+        fat: 20,
+        fiber: 5
+      },
+      cuisine: recipe.cuisine || 'american',
+      difficulty: recipe.difficulty || 'medium',
+      rating: recipe.average_rating || 0,
+      ratingCount: recipe.rating_count || 0
+    };
+    
+    res.json(formattedRecipe);
   } catch (error) {
     console.error('Get recipe error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -756,13 +829,49 @@ app.post('/api/recipes/:id/rate', async (req, res) => {
     if (!rating || rating < 1 || rating > 5) {
       return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     }
-
+    
+    if (!deviceId) {
+      return res.status(400).json({ error: 'Device ID is required' });
+    }
+    
+    console.log(`Rating recipe ${id} with ${rating} stars from device ${deviceId}`);
+    
+    // Update or insert rating in recipe_views
     await pool.query(
-      'UPDATE recipe_usage SET rating = $1 WHERE recipe_id = $2 AND device_id = $3 AND used_at = (SELECT MAX(used_at) FROM recipe_usage WHERE recipe_id = $2 AND device_id = $3)',
-      [rating, id, deviceId]
+      `INSERT INTO recipe_views (recipe_id, device_id, rating) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (recipe_id, device_id) 
+       DO UPDATE SET rating = $3, viewed_at = CURRENT_TIMESTAMP`,
+      [id, deviceId, rating]
     );
+    
+    // Update average rating in recipes table
+    const ratingStats = await pool.query(
+      `SELECT 
+        COUNT(DISTINCT device_id) as total_ratings,
+        AVG(rating) as avg_rating
+       FROM recipe_views 
+       WHERE recipe_id = $1 AND rating IS NOT NULL`,
+      [id]
+    );
+    
+    if (ratingStats.rows.length > 0) {
+      const { total_ratings, avg_rating } = ratingStats.rows[0];
+      await pool.query(
+        'UPDATE recipes SET rating_count = $1, average_rating = $2 WHERE id = $3',
+        [total_ratings, avg_rating, id]
+      );
+    }
+    
+    // If it's a 5-star rating and not already submitted, mark as community recipe
+    if (rating === 5) {
+      await pool.query(
+        'UPDATE recipes SET submitted_by = $1 WHERE id = $2 AND submitted_by IS NULL',
+        [deviceId, id]
+      );
+    }
 
-    res.json({ success: true });
+    res.json({ success: true, message: `Recipe rated ${rating} stars` });
   } catch (error) {
     console.error('Rate recipe error:', error);
     res.status(500).json({ error: 'Internal server error' });
