@@ -706,7 +706,8 @@ app.get('/api/recipes/most-saved', async (req, res) => {
 // Get top community recipes (most 5-starred)
 app.get('/api/recipes/top-community', async (req, res) => {
   try {
-    // Query to get top 10 recipes based on 5-star rating count
+    // Query to get top 10 recipes based on average rating and number of ratings
+    // Only includes recipes that have been rated
     const topRecipesResult = await pool.query(`
       SELECT 
         r.id,
@@ -715,39 +716,43 @@ app.get('/api/recipes/top-community', async (req, res) => {
         r.cuisine,
         r.prep_time,
         r.cook_time,
-        COUNT(DISTINCT rv.device_id) FILTER (WHERE rv.rating = 5) as rating_count,
+        COUNT(DISTINCT rv.device_id) as total_ratings,
+        COUNT(DISTINCT rv.device_id) FILTER (WHERE rv.rating = 5) as five_star_count,
+        ROUND(AVG(rv.rating)::numeric, 1) as average_rating,
         r.created_at
       FROM recipes r
-      LEFT JOIN recipe_views rv ON r.id = rv.recipe_id
+      INNER JOIN recipe_views rv ON r.id = rv.recipe_id
       WHERE r.submitted_by IS NOT NULL  -- Only community-submitted recipes
+        AND rv.rating IS NOT NULL      -- Only include rated recipes
       GROUP BY r.id, r.title, r.servings, r.cuisine, r.prep_time, r.cook_time, r.created_at
-      HAVING COUNT(DISTINCT rv.device_id) FILTER (WHERE rv.rating = 5) > 0
-      ORDER BY rating_count DESC, r.created_at DESC
+      HAVING COUNT(DISTINCT rv.device_id) > 0  -- Must have at least one rating
+      ORDER BY 
+        average_rating DESC,           -- Sort by average rating first
+        five_star_count DESC,          -- Then by number of 5-star ratings
+        total_ratings DESC,            -- Then by total number of ratings
+        r.created_at DESC              -- Finally by creation date
       LIMIT 10
     `);
     
     if (topRecipesResult.rows.length === 0) {
-      // If no community recipes with ratings, return most recent community recipes
-      const recentResult = await pool.query(`
-        SELECT 
-          r.id,
-          r.title,
-          r.servings,
-          r.cuisine,
-          r.prep_time,
-          r.cook_time,
-          0 as rating_count,
-          r.created_at
-        FROM recipes r
-        WHERE r.submitted_by IS NOT NULL
-        ORDER BY r.created_at DESC
-        LIMIT 10
-      `);
-      
-      return res.json(recentResult.rows);
+      // If no rated community recipes exist, return empty array
+      return res.json([]);
     }
     
-    res.json(topRecipesResult.rows);
+    // Format the response to include rating information
+    const formattedRecipes = topRecipesResult.rows.map(recipe => ({
+      id: recipe.id,
+      title: recipe.title,
+      servings: recipe.servings,
+      cuisine: recipe.cuisine,
+      prep_time: recipe.prep_time,
+      cook_time: recipe.cook_time,
+      rating_count: parseInt(recipe.total_ratings),
+      average_rating: parseFloat(recipe.average_rating),
+      five_star_count: parseInt(recipe.five_star_count)
+    }));
+    
+    res.json(formattedRecipes);
   } catch (error) {
     console.error('Get top community recipes error:', error);
     res.status(500).json({ error: 'Internal server error' });
