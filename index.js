@@ -821,6 +821,61 @@ app.get('/api/debug/recipe-views', async (req, res) => {
   }
 });
 
+// TEMPORARY DEBUG ENDPOINT - Check recipe matching
+app.post('/api/debug/check-matches', async (req, res) => {
+  try {
+    const { ingredients, deviceId } = req.body;
+    
+    // Get all recipes that match ANY of the ingredients
+    const anyMatch = await pool.query(`
+      SELECT DISTINCT r.id, r.title, 
+        array_agg(DISTINCT i.name) as matching_ingredients
+      FROM recipes r
+      JOIN recipe_ingredients ri ON r.id = ri.recipe_id
+      JOIN ingredients i ON ri.ingredient_id = i.id
+      WHERE LOWER(i.name) = ANY($1::text[])
+      GROUP BY r.id, r.title
+      ORDER BY r.id
+    `, [ingredients.map(i => i.toLowerCase())]);
+    
+    // Get viewed recipes for this device
+    const viewed = await pool.query(
+      'SELECT recipe_id FROM recipe_views WHERE device_id = $1',
+      [deviceId]
+    );
+    const viewedIds = viewed.rows.map(r => r.recipe_id);
+    
+    // Get recipes that match ALL ingredients (more strict)
+    const allMatch = await pool.query(`
+      SELECT r.id, r.title, COUNT(DISTINCT i.name) as match_count
+      FROM recipes r
+      JOIN recipe_ingredients ri ON r.id = ri.recipe_id
+      JOIN ingredients i ON ri.ingredient_id = i.id
+      WHERE LOWER(i.name) = ANY($1::text[])
+      GROUP BY r.id, r.title
+      HAVING COUNT(DISTINCT i.name) = $2
+      ORDER BY r.id
+    `, [ingredients.map(i => i.toLowerCase()), ingredients.length]);
+    
+    res.json({
+      requestedIngredients: ingredients,
+      recipesMatchingAnyIngredient: anyMatch.rows,
+      recipesMatchingAllIngredients: allMatch.rows,
+      viewedByThisDevice: viewedIds,
+      availableAfterExclusion: anyMatch.rows.filter(r => !viewedIds.includes(r.id)),
+      summary: {
+        totalRecipesInDB: anyMatch.rows.length,
+        matchingAll: allMatch.rows.length,
+        alreadyViewed: viewedIds.length,
+        stillAvailable: anyMatch.rows.filter(r => !viewedIds.includes(r.id)).length
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start server
 app.listen(port, () => {
   console.log(`FridgePodge API server running on port ${port}`);
