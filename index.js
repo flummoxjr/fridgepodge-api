@@ -37,15 +37,59 @@ const pool = new Pool({
 // In-memory cache (can be replaced with Redis)
 const cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 });
 
-// Test database connection on startup
+// Test database connection and ensure tables exist on startup
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
     console.error('Database connection failed:', err.message);
     console.error('Please check DATABASE_URL environment variable in Render dashboard');
   } else {
     console.log('Database connected successfully at:', res.rows[0].now);
+    // Initialize required tables
+    initializeDatabaseTables();
   }
 });
+
+// Function to ensure all required tables exist
+async function initializeDatabaseTables() {
+  try {
+    console.log('Checking and creating required database tables...');
+    
+    // Create recipe_views table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS recipe_views (
+        id SERIAL PRIMARY KEY,
+        recipe_id INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+        device_id VARCHAR(255) NOT NULL,
+        viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(recipe_id, device_id)
+      )
+    `);
+    console.log('✓ recipe_views table ready');
+    
+    // Create indexes for better performance
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_recipe_views_device ON recipe_views(device_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_recipe_views_recipe ON recipe_views(recipe_id)');
+    console.log('✓ Indexes created');
+    
+    // Add submitted_by column to recipes if it doesn't exist
+    await pool.query('ALTER TABLE recipes ADD COLUMN IF NOT EXISTS submitted_by VARCHAR(255)');
+    console.log('✓ submitted_by column ready');
+    
+    // Check current stats
+    const stats = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM recipe_views) as total_views,
+        (SELECT COUNT(DISTINCT device_id) FROM recipe_views) as unique_devices,
+        (SELECT COUNT(*) FROM recipes) as total_recipes
+    `);
+    
+    console.log('Database stats:', stats.rows[0]);
+    
+  } catch (error) {
+    console.error('Error initializing database tables:', error.message);
+    // Don't crash the server, but log the error
+  }
+}
 
 // Trust proxy for Render deployment - specific to Render's proxy
 app.set('trust proxy', 1); // Trust first proxy only
@@ -183,17 +227,36 @@ app.post('/api/recipes/match', async (req, res) => {
       return res.json(cachedResult);
     }
 
-    // Get previously used recipes for this device
-    let usedRecipeIds = [];
+    // Get previously viewed recipes and recipes submitted by this device (V6.7)
+    let excludedRecipeIds = [];
     if (deviceId) {
-      const usedRecipes = await pool.query(
-        'SELECT DISTINCT recipe_id FROM recipe_usage WHERE device_id = $1 AND used_at > NOW() - INTERVAL \'7 days\'',
+      // Get recipes this device has already seen
+      const viewedRecipes = await pool.query(
+        'SELECT DISTINCT recipe_id FROM recipe_views WHERE device_id = $1',
         [deviceId]
       );
-      usedRecipeIds = usedRecipes.rows.map(r => r.recipe_id);
+      
+      console.log(`Device ${deviceId} has viewed ${viewedRecipes.rows.length} recipes:`, 
+        viewedRecipes.rows.map(r => r.recipe_id).join(', '));
+      
+      // Get recipes submitted by this device
+      const submittedRecipes = await pool.query(
+        'SELECT DISTINCT id FROM recipes WHERE submitted_by = $1',
+        [deviceId]
+      );
+      
+      console.log(`Device ${deviceId} has submitted ${submittedRecipes.rows.length} recipes:`,
+        submittedRecipes.rows.map(r => r.id).join(', '));
+      
+      excludedRecipeIds = [
+        ...viewedRecipes.rows.map(r => r.recipe_id),
+        ...submittedRecipes.rows.map(r => r.id)
+      ];
+      
+      console.log(`Total excluded recipe IDs for device ${deviceId}:`, excludedRecipeIds.join(', ') || 'none');
     }
 
-    // Simple matching query
+    // Enhanced matching query that excludes viewed and submitted recipes (V6.7)
     const matchQuery = `
       WITH user_ingredients AS (
         SELECT LOWER(unnest($1::text[])) as ingredient
@@ -217,7 +280,7 @@ app.post('/api/recipes/match', async (req, res) => {
         JOIN ingredients i ON ri.ingredient_id = i.id
         JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
         WHERE r.id != ALL($2::int[])
-        GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count
+        GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
         HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
       )
       SELECT * FROM recipe_matches
@@ -227,7 +290,7 @@ app.post('/api/recipes/match', async (req, res) => {
 
     const result = await pool.query(matchQuery, [
       coreIngredients,
-      usedRecipeIds
+      excludedRecipeIds
     ]);
 
     if (result.rows.length === 0) {
@@ -271,12 +334,26 @@ app.post('/api/recipes/match', async (req, res) => {
       nutrition: nutritionResult.rows[0] || null
     };
     
-    // Record usage
+    // Record view (V6.7 - track which recipes users have seen)
     if (deviceId) {
-      await pool.query(
-        'INSERT INTO recipe_usage (recipe_id, device_id) VALUES ($1, $2)',
-        [recipe.id, deviceId]
-      );
+      try {
+        const viewResult = await pool.query(
+          'INSERT INTO recipe_views (recipe_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
+          [recipe.id, deviceId]
+        );
+        
+        if (viewResult.rows.length > 0) {
+          console.log(`✓ Recorded new view: device ${deviceId} viewed recipe ${recipe.id}`);
+        } else {
+          console.log(`ℹ View already exists: device ${deviceId} already viewed recipe ${recipe.id}`);
+        }
+      } catch (viewError) {
+        console.error('Failed to record recipe view:', viewError.message);
+        console.error('Recipe ID:', recipe.id, 'Device ID:', deviceId);
+        // Don't fail the request if view tracking fails
+      }
+    } else {
+      console.log('⚠ No device ID provided, view not tracked');
     }
     
     // Cache the result
@@ -355,12 +432,12 @@ app.post('/api/recipes/save-favorite', async (req, res) => {
         return total || 30;
       };
       
-      // Insert new recipe
+      // Insert new recipe with submitted_by field
       const recipeResult = await pool.query(
         `INSERT INTO recipes (
           title, cuisine, servings, prep_time, cook_time, 
-          difficulty, source, average_rating, rating_count
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+          difficulty, source, average_rating, rating_count, submitted_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
         RETURNING id`,
         [
           recipe.title,
@@ -371,7 +448,8 @@ app.post('/api/recipes/save-favorite', async (req, res) => {
           recipe.difficulty || 'medium',
           'user_generated',
           5.0,
-          1
+          1,
+          deviceId || null
         ]
       );
       
@@ -634,6 +712,63 @@ app.post('/api/recipes/:id/rate', async (req, res) => {
   } catch (error) {
     console.error('Rate recipe error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Debug endpoint to check recipe views tracking
+app.get('/api/debug/recipe-views', async (req, res) => {
+  try {
+    // Check if table exists
+    const tableCheck = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'recipe_views'
+      );
+    `);
+    
+    if (!tableCheck.rows[0].exists) {
+      return res.json({
+        error: 'recipe_views table does not exist!',
+        message: 'The table will be created on next server restart'
+      });
+    }
+    
+    // Get stats
+    const stats = await pool.query(`
+      SELECT 
+        COUNT(*) as total_views,
+        COUNT(DISTINCT device_id) as unique_devices,
+        COUNT(DISTINCT recipe_id) as unique_recipes
+      FROM recipe_views
+    `);
+    
+    // Get recent views
+    const recentViews = await pool.query(`
+      SELECT 
+        rv.device_id,
+        rv.recipe_id,
+        r.title,
+        rv.viewed_at
+      FROM recipe_views rv
+      LEFT JOIN recipes r ON rv.recipe_id = r.id
+      ORDER BY rv.viewed_at DESC
+      LIMIT 10
+    `);
+    
+    res.json({
+      status: 'success',
+      tableExists: true,
+      stats: stats.rows[0],
+      recentViews: recentViews.rows,
+      message: 'Recipe view tracking is active'
+    });
+    
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      hint: 'The table will be created automatically on next server restart'
+    });
   }
 });
 
