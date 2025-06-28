@@ -120,13 +120,14 @@ function getCoreIngredient(ingredientName) {
 app.get('/', (req, res) => {
   res.json({ 
     service: 'FridgePodge Recipe API',
-    version: '1.1.0',
+    version: '1.2.0',
     status: 'running',
     endpoints: {
       health: '/health',
       recipeMatch: 'POST /api/recipes/match',
       saveFavorite: 'POST /api/recipes/save-favorite',
       popular: 'GET /api/recipes/popular',
+      mostSaved: 'GET /api/recipes/most-saved',
       recipeById: 'GET /api/recipes/:id',
       rateRecipe: 'POST /api/recipes/:id/rate'
     }
@@ -208,6 +209,7 @@ app.post('/api/recipes/match', async (req, res) => {
           r.difficulty,
           r.average_rating,
           r.rating_count,
+          r.saved_by_count,
           COUNT(DISTINCT i.id) as matched_ingredients,
           COUNT(DISTINCT ri.ingredient_id) as total_ingredients
         FROM recipes r
@@ -261,6 +263,7 @@ app.post('/api/recipes/match', async (req, res) => {
       difficulty: recipe.difficulty,
       rating: recipe.average_rating,
       ratingCount: recipe.rating_count,
+      savedByCount: recipe.saved_by_count || 0,
       ingredients: ingredientsResult.rows.map(ing => 
         `${ing.amount} ${ing.unit} ${ing.name}`.trim()
       ),
@@ -447,12 +450,24 @@ app.post('/api/recipes/save-favorite', async (req, res) => {
         );
       }
       
-      // Record device submission
+      // Record device submission in both tables
       if (deviceId) {
+        // Record in recipe_usage for compatibility
         await pool.query(
           'INSERT INTO recipe_usage (recipe_id, device_id, rating) VALUES ($1, $2, $3)',
           [recipeId, deviceId, rating]
         );
+        
+        // Record in user_saved_recipes for tracking unique saves
+        if (rating === 5) {
+          await pool.query(
+            `INSERT INTO user_saved_recipes (recipe_id, device_id, rating) 
+             VALUES ($1, $2, $3) 
+             ON CONFLICT (recipe_id, device_id) 
+             DO UPDATE SET rating = $3, saved_at = CURRENT_TIMESTAMP`,
+            [recipeId, deviceId, rating]
+          );
+        }
       }
       
       await pool.query('COMMIT');
@@ -492,7 +507,8 @@ app.get('/api/recipes/popular', async (req, res) => {
         r.cook_time,
         r.difficulty,
         r.average_rating,
-        r.rating_count
+        r.rating_count,
+        r.saved_by_count
       FROM recipes r
       WHERE r.source = 'user_generated' 
         AND r.average_rating >= 4.5
@@ -508,6 +524,46 @@ app.get('/api/recipes/popular', async (req, res) => {
   } catch (error) {
     console.error('Error fetching popular recipes:', error);
     res.status(500).json({ error: 'Failed to fetch popular recipes' });
+  }
+});
+
+// Get most-saved recipes endpoint
+app.get('/api/recipes/most-saved', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        r.id,
+        r.title,
+        r.cuisine,
+        r.servings,
+        r.prep_time,
+        r.cook_time,
+        r.difficulty,
+        r.average_rating,
+        r.rating_count,
+        r.saved_by_count,
+        ARRAY_AGG(DISTINCT i.name) as ingredients
+      FROM recipes r
+      LEFT JOIN recipe_ingredients ri ON r.id = ri.recipe_id
+      LEFT JOIN ingredients i ON ri.ingredient_id = i.id
+      WHERE r.saved_by_count > 0
+      GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, 
+               r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
+      ORDER BY r.saved_by_count DESC, r.average_rating DESC
+      LIMIT 20
+    `);
+    
+    res.json({
+      success: true,
+      recipes: result.rows.map(recipe => ({
+        ...recipe,
+        prepTime: `${recipe.prep_time} minutes`,
+        cookTime: `${recipe.cook_time} minutes`
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching most-saved recipes:', error);
+    res.status(500).json({ error: 'Failed to fetch most-saved recipes' });
   }
 });
 
