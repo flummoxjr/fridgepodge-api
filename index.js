@@ -342,7 +342,12 @@ app.post('/api/recipes/match', async (req, res) => {
     const result = await pool.query(matchQuery, queryParams);
 
     if (result.rows.length === 0) {
-      return res.json({ found: false });
+      console.log(`No available recipes for device ${deviceId} after exclusions`);
+      return res.json({ 
+        found: false,
+        reason: 'all_viewed',
+        message: 'All matching recipes have been viewed. App will generate a new one.'
+      });
     }
 
     const recipe = result.rows[0];
