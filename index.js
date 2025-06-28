@@ -257,47 +257,85 @@ app.post('/api/recipes/match', async (req, res) => {
     }
 
     // Enhanced matching query that excludes viewed and submitted recipes (V6.7)
-    const matchQuery = `
-      WITH user_ingredients AS (
-        SELECT LOWER(unnest($1::text[])) as ingredient
-      ),
-      recipe_matches AS (
-        SELECT 
-          r.id,
-          r.title,
-          r.cuisine,
-          r.servings,
-          r.prep_time,
-          r.cook_time,
-          r.difficulty,
-          r.average_rating,
-          r.rating_count,
-          r.saved_by_count,
-          COUNT(DISTINCT i.id) as matched_ingredients,
-          COUNT(DISTINCT ri.ingredient_id) as total_ingredients
-        FROM recipes r
-        JOIN recipe_ingredients ri ON r.id = ri.recipe_id
-        JOIN ingredients i ON ri.ingredient_id = i.id
-        JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
-        WHERE r.id != ALL($2::int[])
-        GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
-        HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
-      )
-      SELECT * FROM recipe_matches
-      ORDER BY matched_ingredients DESC, average_rating DESC
-      LIMIT 1;
-    `;
+    let matchQuery;
+    let queryParams;
+    
+    // Handle the case where there are recipes to exclude
+    if (excludedRecipeIds.length > 0) {
+      console.log(`Excluding ${excludedRecipeIds.length} recipes from search`);
+      matchQuery = `
+        WITH user_ingredients AS (
+          SELECT LOWER(unnest($1::text[])) as ingredient
+        ),
+        recipe_matches AS (
+          SELECT 
+            r.id,
+            r.title,
+            r.cuisine,
+            r.servings,
+            r.prep_time,
+            r.cook_time,
+            r.difficulty,
+            r.average_rating,
+            r.rating_count,
+            r.saved_by_count,
+            COUNT(DISTINCT i.id) as matched_ingredients,
+            COUNT(DISTINCT ri.ingredient_id) as total_ingredients
+          FROM recipes r
+          JOIN recipe_ingredients ri ON r.id = ri.recipe_id
+          JOIN ingredients i ON ri.ingredient_id = i.id
+          JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
+          WHERE r.id NOT IN (SELECT unnest($2::int[]))
+          GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
+          HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
+        )
+        SELECT * FROM recipe_matches
+        ORDER BY matched_ingredients DESC, average_rating DESC
+        LIMIT 1;
+      `;
+      queryParams = [coreIngredients, excludedRecipeIds];
+    } else {
+      console.log('No recipes to exclude, searching all recipes');
+      matchQuery = `
+        WITH user_ingredients AS (
+          SELECT LOWER(unnest($1::text[])) as ingredient
+        ),
+        recipe_matches AS (
+          SELECT 
+            r.id,
+            r.title,
+            r.cuisine,
+            r.servings,
+            r.prep_time,
+            r.cook_time,
+            r.difficulty,
+            r.average_rating,
+            r.rating_count,
+            r.saved_by_count,
+            COUNT(DISTINCT i.id) as matched_ingredients,
+            COUNT(DISTINCT ri.ingredient_id) as total_ingredients
+          FROM recipes r
+          JOIN recipe_ingredients ri ON r.id = ri.recipe_id
+          JOIN ingredients i ON ri.ingredient_id = i.id
+          JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
+          GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
+          HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
+        )
+        SELECT * FROM recipe_matches
+        ORDER BY matched_ingredients DESC, average_rating DESC
+        LIMIT 1;
+      `;
+      queryParams = [coreIngredients];
+    }
 
-    const result = await pool.query(matchQuery, [
-      coreIngredients,
-      excludedRecipeIds
-    ]);
+    const result = await pool.query(matchQuery, queryParams);
 
     if (result.rows.length === 0) {
       return res.json({ found: false });
     }
 
     const recipe = result.rows[0];
+    console.log(`Found matching recipe: "${recipe.title}" (ID: ${recipe.id}) for device ${deviceId}`);
     
     // Get full recipe details
     const ingredientsResult = await pool.query(
