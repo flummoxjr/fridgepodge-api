@@ -249,11 +249,15 @@ app.post('/api/recipes/match', async (req, res) => {
         submittedRecipes.rows.map(r => r.id).join(', '));
       
       excludedRecipeIds = [
-        ...viewedRecipes.rows.map(r => r.recipe_id),
-        ...submittedRecipes.rows.map(r => r.id)
-      ];
+        ...viewedRecipes.rows.map(r => parseInt(r.recipe_id)),
+        ...submittedRecipes.rows.map(r => parseInt(r.id))
+      ].filter(id => !isNaN(id)); // Ensure all are valid integers
       
-      console.log(`Total excluded recipe IDs for device ${deviceId}:`, excludedRecipeIds.join(', ') || 'none');
+      // Debug: Check data types
+      console.log(`Raw viewed recipes:`, viewedRecipes.rows);
+      console.log(`Excluded recipe IDs for device ${deviceId}:`, excludedRecipeIds);
+      console.log(`Excluded IDs types:`, excludedRecipeIds.map(id => typeof id));
+      console.log(`Excluded IDs as string:`, excludedRecipeIds.join(', ') || 'none');
     }
 
     // Enhanced matching query that excludes viewed and submitted recipes (V6.7)
@@ -263,6 +267,13 @@ app.post('/api/recipes/match', async (req, res) => {
     // Handle the case where there are recipes to exclude
     if (excludedRecipeIds.length > 0) {
       console.log(`Excluding ${excludedRecipeIds.length} recipes from search`);
+      
+      // Test query to verify exclusion works
+      const testExclusion = await pool.query(
+        'SELECT id FROM recipes WHERE id = ANY($1::int[])',
+        [excludedRecipeIds]
+      );
+      console.log(`Test: Found ${testExclusion.rows.length} recipes that should be excluded`);
       matchQuery = `
         WITH user_ingredients AS (
           SELECT LOWER(unnest($1::text[])) as ingredient
@@ -285,7 +296,7 @@ app.post('/api/recipes/match', async (req, res) => {
           JOIN recipe_ingredients ri ON r.id = ri.recipe_id
           JOIN ingredients i ON ri.ingredient_id = i.id
           JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
-          WHERE r.id NOT IN (SELECT unnest($2::int[]))
+          WHERE NOT (r.id = ANY($2::int[]))
           GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
           HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
         )
