@@ -217,15 +217,16 @@ app.post('/api/recipes/match', async (req, res) => {
     // Extract core ingredients from user input
     const coreIngredients = ingredients.map(ing => getCoreIngredient(ing.toLowerCase()));
 
-    // Create cache key
-    const cacheKey = `match:${coreIngredients.sort().join(',')}:${dietary||''}:${cuisine||''}`;
+    // Create cache key that includes device ID to ensure personalized results
+    const cacheKey = `match:${coreIngredients.sort().join(',')}:${dietary||''}:${cuisine||''}:${deviceId||'anon'}`;
     
-    // Check cache first
-    const cachedResult = cache.get(cacheKey);
-    if (cachedResult) {
-      console.log('Cache hit:', cacheKey);
-      return res.json(cachedResult);
-    }
+    // Skip cache for now to ensure exclusion works properly
+    // TODO: Re-enable cache after fixing exclusion logic
+    // const cachedResult = cache.get(cacheKey);
+    // if (cachedResult) {
+    //   console.log('Cache hit:', cacheKey);
+    //   return res.json(cachedResult);
+    // }
 
     // Get previously viewed recipes and recipes submitted by this device (V6.7)
     let excludedRecipeIds = [];
@@ -370,25 +371,7 @@ app.post('/api/recipes/match', async (req, res) => {
     );
 
     // Format recipe for response
-    const formattedRecipe = {
-      id: recipe.id,
-      title: recipe.title,
-      cuisine: recipe.cuisine,
-      servings: recipe.servings,
-      prepTime: `${recipe.prep_time} minutes`,
-      cookTime: `${recipe.cook_time} minutes`,
-      difficulty: recipe.difficulty,
-      rating: recipe.average_rating,
-      ratingCount: recipe.rating_count,
-      savedByCount: recipe.saved_by_count || 0,
-      ingredients: ingredientsResult.rows.map(ing => 
-        `${ing.amount} ${ing.unit} ${ing.name}`.trim()
-      ),
-      instructions: instructionsResult.rows.map(inst => inst.instruction),
-      nutrition: nutritionResult.rows[0] || null
-    };
-    
-    // Record view (V6.7 - track which recipes users have seen)
+    // IMPORTANT: Record view BEFORE sending recipe to prevent duplicates
     if (deviceId) {
       try {
         const viewResult = await pool.query(
@@ -410,9 +393,30 @@ app.post('/api/recipes/match', async (req, res) => {
       console.log('⚠ No device ID provided, view not tracked');
     }
     
-    // Cache the result
-    const response = { found: true, recipe: formattedRecipe };
-    cache.set(cacheKey, response);
+    const formattedRecipe = {
+      id: recipe.id,
+      title: recipe.title,
+      cuisine: recipe.cuisine,
+      servings: recipe.servings,
+      prepTime: `${recipe.prep_time} minutes`,
+      cookTime: `${recipe.cook_time} minutes`,
+      difficulty: recipe.difficulty,
+      rating: recipe.average_rating,
+      ratingCount: recipe.rating_count,
+      savedByCount: recipe.saved_by_count || 0,
+      ingredients: ingredientsResult.rows.map(ing => 
+        `${ing.amount} ${ing.unit} ${ing.name}`.trim()
+      ),
+      instructions: instructionsResult.rows.map(inst => inst.instruction),
+      nutrition: nutritionResult.rows[0] || null
+    };
+    
+    // Build response
+    const response = { found: true, recipe: formattedRecipe, fromDatabase: true };
+    
+    // Don't cache for now to ensure exclusion works
+    // TODO: Re-enable caching with device-specific keys
+    // cache.set(cacheKey, response);
     
     res.json(response);
     
