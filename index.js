@@ -261,25 +261,18 @@ app.post('/api/recipes/match', async (req, res) => {
       console.log(`Excluded IDs as string:`, excludedRecipeIds.join(', ') || 'none');
     }
 
-    // Enhanced matching query that excludes viewed and submitted recipes (V6.7)
+    // V7.5: Strict matching - only return recipes with EXACT same ingredients
+    console.log(`V7.5: Looking for recipes with EXACT ingredients: ${coreIngredients.join(', ')}`);
+    
     let matchQuery;
     let queryParams;
     
-    // Handle the case where there are recipes to exclude
+    // Build the exact match query
     if (excludedRecipeIds.length > 0) {
-      console.log(`Excluding ${excludedRecipeIds.length} recipes from search`);
+      console.log(`Excluding ${excludedRecipeIds.length} already viewed recipes`);
       
-      // Test query to verify exclusion works
-      const testExclusion = await pool.query(
-        'SELECT id FROM recipes WHERE id = ANY($1::int[])',
-        [excludedRecipeIds]
-      );
-      console.log(`Test: Found ${testExclusion.rows.length} recipes that should be excluded`);
       matchQuery = `
-        WITH user_ingredients AS (
-          SELECT LOWER(unnest($1::text[])) as ingredient
-        ),
-        recipe_matches AS (
+        WITH recipe_ingredient_counts AS (
           SELECT 
             r.id,
             r.title,
@@ -291,28 +284,27 @@ app.post('/api/recipes/match', async (req, res) => {
             r.average_rating,
             r.rating_count,
             r.saved_by_count,
-            COUNT(DISTINCT i.id) as matched_ingredients,
-            COUNT(DISTINCT ri.ingredient_id) as total_ingredients
+            COUNT(DISTINCT i.id) as total_ingredients,
+            COUNT(DISTINCT CASE WHEN LOWER(i.name) = ANY($1::text[]) THEN i.id END) as matched_ingredients,
+            ARRAY_AGG(DISTINCT LOWER(i.name) ORDER BY LOWER(i.name)) as all_ingredients
           FROM recipes r
           JOIN recipe_ingredients ri ON r.id = ri.recipe_id
           JOIN ingredients i ON ri.ingredient_id = i.id
-          JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
           WHERE NOT (r.id = ANY($2::int[]))
           GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
-          HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
         )
-        SELECT * FROM recipe_matches
-        ORDER BY matched_ingredients DESC, average_rating DESC
+        SELECT * FROM recipe_ingredient_counts
+        WHERE total_ingredients = $3
+          AND matched_ingredients = $3
+          AND total_ingredients = matched_ingredients
+        ORDER BY average_rating DESC, rating_count DESC
         LIMIT 1;
       `;
-      queryParams = [coreIngredients, excludedRecipeIds];
+      queryParams = [coreIngredients, excludedRecipeIds, coreIngredients.length];
     } else {
-      console.log('No recipes to exclude, searching all recipes');
+      console.log('No recipes to exclude, searching all recipes for exact match');
       matchQuery = `
-        WITH user_ingredients AS (
-          SELECT LOWER(unnest($1::text[])) as ingredient
-        ),
-        recipe_matches AS (
+        WITH recipe_ingredient_counts AS (
           SELECT 
             r.id,
             r.title,
@@ -324,35 +316,39 @@ app.post('/api/recipes/match', async (req, res) => {
             r.average_rating,
             r.rating_count,
             r.saved_by_count,
-            COUNT(DISTINCT i.id) as matched_ingredients,
-            COUNT(DISTINCT ri.ingredient_id) as total_ingredients
+            COUNT(DISTINCT i.id) as total_ingredients,
+            COUNT(DISTINCT CASE WHEN LOWER(i.name) = ANY($1::text[]) THEN i.id END) as matched_ingredients,
+            ARRAY_AGG(DISTINCT LOWER(i.name) ORDER BY LOWER(i.name)) as all_ingredients
           FROM recipes r
           JOIN recipe_ingredients ri ON r.id = ri.recipe_id
           JOIN ingredients i ON ri.ingredient_id = i.id
-          JOIN user_ingredients ui ON LOWER(i.name) = ui.ingredient
           GROUP BY r.id, r.title, r.cuisine, r.servings, r.prep_time, r.cook_time, r.difficulty, r.average_rating, r.rating_count, r.saved_by_count
-          HAVING COUNT(DISTINCT i.id) >= GREATEST(1, COUNT(DISTINCT ri.ingredient_id) * 0.5)
         )
-        SELECT * FROM recipe_matches
-        ORDER BY matched_ingredients DESC, average_rating DESC
+        SELECT * FROM recipe_ingredient_counts
+        WHERE total_ingredients = $2
+          AND matched_ingredients = $2
+          AND total_ingredients = matched_ingredients
+        ORDER BY average_rating DESC, rating_count DESC
         LIMIT 1;
       `;
-      queryParams = [coreIngredients];
+      queryParams = [coreIngredients, coreIngredients.length];
     }
 
     const result = await pool.query(matchQuery, queryParams);
 
     if (result.rows.length === 0) {
-      console.log(`No available recipes for device ${deviceId} after exclusions`);
+      console.log(`V7.5: No recipes found with EXACT ingredients [${coreIngredients.join(', ')}] for device ${deviceId}`);
       return res.json({ 
         found: false,
-        reason: 'all_viewed',
-        message: 'All matching recipes have been viewed. App will generate a new one.'
+        reason: 'no_exact_match',
+        message: 'No recipes found with these exact ingredients. Generating a new recipe with AI.'
       });
     }
 
     const recipe = result.rows[0];
-    console.log(`Found matching recipe: "${recipe.title}" (ID: ${recipe.id}) for device ${deviceId}`);
+    console.log(`V7.5: Found EXACT match recipe: "${recipe.title}" (ID: ${recipe.id})`);
+    console.log(`Recipe ingredients: [${recipe.all_ingredients ? recipe.all_ingredients.join(', ') : 'unknown'}]`);
+    console.log(`User ingredients: [${coreIngredients.join(', ')}]`);
     
     // Get full recipe details
     const ingredientsResult = await pool.query(
