@@ -966,6 +966,64 @@ app.post('/api/premium', async (req, res) => {
   }
 });
 
+// Google account migration endpoint
+app.post('/api/migrate-to-google', async (req, res) => {
+  try {
+    const { oldDeviceId, googleId, googleEmail } = req.body;
+    
+    if (!oldDeviceId || !googleId) {
+      return res.status(400).json({ error: 'Old device ID and Google ID are required' });
+    }
+    
+    const newDeviceId = `google-${googleId}`;
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    try {
+      // Update recipe_views
+      await pool.query(
+        'UPDATE recipe_views SET device_id = $1 WHERE device_id = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Update premium_users
+      await pool.query(
+        'UPDATE premium_users SET device_id = $1 WHERE device_id = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Update recipes submitted_by
+      await pool.query(
+        'UPDATE recipes SET submitted_by = $1 WHERE submitted_by = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Add Google email to premium_users if exists
+      if (googleEmail) {
+        await pool.query(
+          'UPDATE premium_users SET purchase_token = $1 WHERE device_id = $2',
+          [googleEmail, newDeviceId]
+        );
+      }
+      
+      await pool.query('COMMIT');
+      
+      res.json({
+        success: true,
+        message: 'Successfully migrated to Google account',
+        newDeviceId: newDeviceId
+      });
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+  } catch (error) {
+    console.error('Error migrating to Google account:', error);
+    res.status(500).json({ error: 'Failed to migrate to Google account' });
+  }
+});
+
 // Debug endpoint to check recipe views tracking
 app.get('/api/debug/recipe-views', async (req, res) => {
   try {
