@@ -79,12 +79,31 @@ async function initializeDatabaseTables() {
     await pool.query('ALTER TABLE recipe_views ADD COLUMN IF NOT EXISTS rating INTEGER CHECK (rating >= 1 AND rating <= 5)');
     console.log('✓ rating column ready in recipe_views');
     
+    // Create premium_users table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS premium_users (
+        id SERIAL PRIMARY KEY,
+        device_id VARCHAR(255) UNIQUE NOT NULL,
+        is_premium BOOLEAN DEFAULT false,
+        purchase_date TIMESTAMP,
+        purchase_token VARCHAR(500),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✓ premium_users table ready');
+    
+    // Create index for premium users
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_premium_users_device ON premium_users(device_id)');
+    console.log('✓ premium_users index created');
+    
     // Check current stats
     const stats = await pool.query(`
       SELECT 
         (SELECT COUNT(*) FROM recipe_views) as total_views,
         (SELECT COUNT(DISTINCT device_id) FROM recipe_views) as unique_devices,
-        (SELECT COUNT(*) FROM recipes) as total_recipes
+        (SELECT COUNT(*) FROM recipes) as total_recipes,
+        (SELECT COUNT(*) FROM premium_users WHERE is_premium = true) as premium_users
     `);
     
     console.log('Database stats:', stats.rows[0]);
@@ -880,6 +899,70 @@ app.post('/api/recipes/:id/rate', async (req, res) => {
   } catch (error) {
     console.error('Rate recipe error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Premium status endpoints
+app.get('/api/premium/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    // Check if device exists in premium_users table
+    const result = await pool.query(
+      'SELECT is_premium, purchase_date FROM premium_users WHERE device_id = $1',
+      [deviceId]
+    );
+    
+    if (result.rows.length > 0) {
+      res.json({
+        isPremium: result.rows[0].is_premium,
+        purchaseDate: result.rows[0].purchase_date
+      });
+    } else {
+      // Device not found, not premium
+      res.json({
+        isPremium: false
+      });
+    }
+  } catch (error) {
+    console.error('Error checking premium status:', error);
+    res.status(500).json({ error: 'Failed to check premium status' });
+  }
+});
+
+app.post('/api/premium', async (req, res) => {
+  try {
+    const { deviceId, isPremium, purchaseToken } = req.body;
+    
+    if (!deviceId) {
+      return res.status(400).json({ error: 'Device ID is required' });
+    }
+    
+    // Insert or update premium status
+    const result = await pool.query(
+      `INSERT INTO premium_users (device_id, is_premium, purchase_date, purchase_token)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (device_id) 
+       DO UPDATE SET 
+         is_premium = EXCLUDED.is_premium,
+         purchase_date = CASE 
+           WHEN EXCLUDED.is_premium = true THEN CURRENT_TIMESTAMP 
+           ELSE premium_users.purchase_date 
+         END,
+         purchase_token = EXCLUDED.purchase_token,
+         updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [deviceId, isPremium || false, isPremium ? new Date() : null, purchaseToken || null]
+    );
+    
+    res.json({
+      success: true,
+      isPremium: result.rows[0].is_premium,
+      message: isPremium ? 'Premium status activated' : 'Premium status updated'
+    });
+  } catch (error) {
+    console.error('Error updating premium status:', error);
+    res.status(500).json({ error: 'Failed to update premium status' });
   }
 });
 
