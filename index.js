@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const NodeCache = require('node-cache');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
@@ -36,6 +37,21 @@ const pool = new Pool({
 
 // In-memory cache (can be replaced with Redis)
 const cache = new NodeCache({ stdTTL: process.env.CACHE_TTL || 3600 });
+
+// Gemini API configuration
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_15_FLASH_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+const GEMINI_20_FLASH_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent';
+
+// Rate limiter for recipe generation (stricter limits)
+const recipeGenerationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Limit each device to 10 requests per windowMs
+  message: 'Too many recipe generation requests, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.body.deviceId || req.ip
+});
 
 // Test database connection and ensure tables exist on startup
 pool.query('SELECT NOW()', (err, res) => {
@@ -361,11 +377,193 @@ app.post('/api/recipes/match', async (req, res) => {
 
     if (result.rows.length === 0) {
       console.log(`V7.5: No recipes found with EXACT ingredients [${coreIngredients.join(', ')}] for device ${deviceId}`);
-      return res.json({ 
-        found: false,
-        reason: 'no_exact_match',
-        message: 'No recipes found with these exact ingredients. Generating a new recipe with AI.'
-      });
+      console.log('Falling back to AI generation...');
+      
+      // Generate recipe using AI when no database match is found
+      try {
+        // Check if Gemini API key is configured
+        if (!GEMINI_API_KEY) {
+          console.error('Gemini API key not configured');
+          return res.status(500).json({ error: 'Recipe generation service not configured' });
+        }
+        
+        // Stage 1: Generate initial recipe with Gemini 1.5 Flash
+        console.log('Stage 1: Generating initial recipe with Gemini 1.5 Flash...');
+        
+        const simplePrompt = `Create a ${cuisine || 'delicious'} recipe using ONLY these ingredients: ${ingredients.join(', ')}. 
+        ${dietary ? `Dietary restriction: ${dietary}.` : ''}
+        Available seasonings: salt, pepper, common spices.
+        Return a JSON object with: title, description, ingredients (with amounts), instructions (array), prepTime, cookTime, servings, difficulty, cuisine, nutrition (calories, protein, carbs, fat, fiber).`;
+        
+        const stage1Response = await axios.post(
+          `${GEMINI_15_FLASH_URL}?key=${GEMINI_API_KEY}`,
+          {
+            contents: [{
+              parts: [{
+                text: simplePrompt
+              }]
+            }],
+            generationConfig: {
+              temperature: 0.8,
+              topK: 1,
+              topP: 1,
+              maxOutputTokens: 1024,
+            },
+            safetySettings: [
+              {
+                category: "HARM_CATEGORY_HARASSMENT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_HATE_SPEECH",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              }
+            ]
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            timeout: 15000
+          }
+        );
+        
+        let initialRecipe;
+        if (stage1Response.data && stage1Response.data.candidates && stage1Response.data.candidates[0]) {
+          const generatedText = stage1Response.data.candidates[0].content.parts[0].text;
+          try {
+            const cleanedText = generatedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            initialRecipe = JSON.parse(cleanedText);
+          } catch (e) {
+            initialRecipe = {
+              title: "Quick Recipe",
+              description: "A delicious dish made with your ingredients",
+              ingredients: ingredients.map(ing => `Some ${ing}`),
+              instructions: ["Prepare and cook ingredients as needed"],
+              prepTime: "30 minutes",
+              cookTime: "30 minutes",
+              servings: "4",
+              difficulty: "medium",
+              cuisine: cuisine || "american",
+              nutrition: {
+                calories: 350,
+                protein: "25g",
+                carbs: "40g",
+                fat: "12g",
+                fiber: "5g"
+              }
+            };
+          }
+        } else {
+          throw new Error('Stage 1 generation failed');
+        }
+        
+        // Stage 2: Review and correct with Gemini 2.0 Flash
+        console.log('Stage 2: Reviewing and correcting with Gemini 2.0 Flash...');
+        
+        const validationPrompt = `Review and fix this recipe. CRITICAL RULES:
+1. ONLY use these exact ingredients: ${ingredients.join(', ')}
+2. Remove ANY ingredients not in the list above
+3. Fix unrealistic quantities
+4. Ensure instructions are clear and logical
+5. Add proper measurements to all ingredients
+6. Include nutrition info: calories, protein, carbs, fat, fiber
+7. Ensure all fields are present: title, description, ingredients, instructions, prepTime, cookTime, servings, difficulty, cuisine, nutrition
+
+Current recipe:
+${JSON.stringify(initialRecipe, null, 2)}
+
+Return ONLY the corrected recipe as a valid JSON object with all required fields.`;
+        
+        const stage2Response = await axios.post(
+          `${GEMINI_20_FLASH_URL}?key=${GEMINI_API_KEY}`,
+          {
+            contents: [{
+              parts: [{
+                text: validationPrompt
+              }]
+            }],
+            generationConfig: {
+              temperature: 0.3,
+              topK: 1,
+              topP: 1,
+              maxOutputTokens: 1024,
+            },
+            safetySettings: [
+              {
+                category: "HARM_CATEGORY_HARASSMENT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_HATE_SPEECH",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              },
+              {
+                category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold: "BLOCK_MEDIUM_AND_ABOVE"
+              }
+            ]
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            timeout: 15000
+          }
+        );
+        
+        let finalRecipe = initialRecipe;
+        if (stage2Response.data && stage2Response.data.candidates && stage2Response.data.candidates[0]) {
+          const correctedText = stage2Response.data.candidates[0].content.parts[0].text;
+          
+          try {
+            const cleanedText = correctedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            finalRecipe = JSON.parse(cleanedText);
+            
+            // Ensure nutrition info exists
+            if (!finalRecipe.nutrition) {
+              finalRecipe.nutrition = {
+                calories: 350,
+                protein: "25g",
+                carbs: "40g",
+                fat: "12g",
+                fiber: "5g"
+              };
+            }
+            
+            console.log(`Recipe generated successfully with 2-stage process for device: ${deviceId}`);
+          } catch (parseError) {
+            console.error('Stage 2 parse error, using stage 1 result:', parseError);
+          }
+        }
+        
+        // Return the generated recipe in the same format as database recipes
+        return res.json({
+          found: true,
+          recipe: finalRecipe,
+          fromDatabase: false,
+          source: 'ai-generated'
+        });
+        
+      } catch (aiError) {
+        console.error('AI generation error:', aiError.response?.data || aiError.message);
+        return res.status(500).json({ 
+          error: 'Failed to generate recipe. Please try again.',
+          found: false
+        });
+      }
     }
 
     const recipe = result.rows[0];
@@ -966,7 +1164,55 @@ app.post('/api/premium', async (req, res) => {
   }
 });
 
-// Google account migration endpoint
+// Generic device migration endpoint (supports both Google and Play Games)
+app.post('/api/migrate-device', async (req, res) => {
+  try {
+    const { oldDeviceId, newDeviceId, playGamesId } = req.body;
+    
+    if (!oldDeviceId || !newDeviceId) {
+      return res.status(400).json({ error: 'Old device ID and new device ID are required' });
+    }
+    
+    // Start transaction
+    await pool.query('BEGIN');
+    
+    try {
+      // Update recipe_views
+      await pool.query(
+        'UPDATE recipe_views SET device_id = $1 WHERE device_id = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Update premium_users
+      await pool.query(
+        'UPDATE premium_users SET device_id = $1 WHERE device_id = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Update recipes submitted_by
+      await pool.query(
+        'UPDATE recipes SET submitted_by = $1 WHERE submitted_by = $2',
+        [newDeviceId, oldDeviceId]
+      );
+      
+      // Commit transaction
+      await pool.query('COMMIT');
+      
+      console.log(`Successfully migrated device ${oldDeviceId} to ${newDeviceId}`);
+      res.json({ success: true, newDeviceId });
+      
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+    
+  } catch (error) {
+    console.error('Error migrating device:', error);
+    res.status(500).json({ error: 'Failed to migrate device' });
+  }
+});
+
+// Google account migration endpoint (kept for backward compatibility)
 app.post('/api/migrate-to-google', async (req, res) => {
   try {
     const { oldDeviceId, googleId, googleEmail } = req.body;
@@ -1133,6 +1379,324 @@ app.post('/api/debug/check-matches', async (req, res) => {
     
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Secure recipe generation endpoint
+app.post('/api/recipes/generate', recipeGenerationLimiter, async (req, res) => {
+  try {
+    const { ingredients, theme, dietaryRestrictions, spicePacks, deviceId, prompt } = req.body;
+    
+    // Validate required fields
+    if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
+      return res.status(400).json({ error: 'Ingredients are required' });
+    }
+    
+    if (!deviceId) {
+      return res.status(400).json({ error: 'Device ID is required' });
+    }
+    
+    // Check if Gemini API key is configured
+    if (!GEMINI_API_KEY) {
+      console.error('Gemini API key not configured');
+      return res.status(500).json({ error: 'Recipe generation service not configured' });
+    }
+    
+    // Log the request (but not the API key!)
+    console.log(`Recipe generation request from device: ${deviceId}, ingredients: ${ingredients.length}`);
+    
+    try {
+      // Stage 1: Generate initial recipe with Gemini 1.5 Flash (faster, cheaper)
+      console.log('Stage 1: Generating initial recipe with Gemini 1.5 Flash...');
+      
+      // Simplified prompt for initial generation
+      const simplePrompt = prompt || `Create a ${theme || 'delicious'} recipe using these ingredients: ${ingredients.join(', ')}. 
+      Available seasonings: salt, pepper, common spices.
+      Return a JSON object with: title, description, ingredients (with amounts), instructions (array), prepTime, servings.`;
+      
+      const stage1Response = await axios.post(
+        `${GEMINI_15_FLASH_URL}?key=${GEMINI_API_KEY}`,
+        {
+          contents: [{
+            parts: [{
+              text: simplePrompt
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.8, // Higher creativity for initial generation
+            topK: 1,
+            topP: 1,
+            maxOutputTokens: 1024,
+          },
+          safetySettings: [
+            {
+              category: "HARM_CATEGORY_HARASSMENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_HATE_SPEECH",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            }
+          ]
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000 // 15 second timeout for stage 1
+        }
+      );
+      
+      let initialRecipe;
+      if (stage1Response.data && stage1Response.data.candidates && stage1Response.data.candidates[0]) {
+        const generatedText = stage1Response.data.candidates[0].content.parts[0].text;
+        try {
+          const cleanedText = generatedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          initialRecipe = JSON.parse(cleanedText);
+        } catch (e) {
+          // If parsing fails, create a basic structure
+          initialRecipe = {
+            title: "Quick Recipe",
+            description: "A delicious dish",
+            ingredients: ingredients.map(ing => `Some ${ing}`),
+            instructions: [generatedText],
+            prepTime: "30 minutes",
+            servings: "4"
+          };
+        }
+      } else {
+        throw new Error('Stage 1 generation failed');
+      }
+      
+      // Stage 2: Review and correct with Gemini 2.0 Flash (more accurate)
+      console.log('Stage 2: Reviewing and correcting with Gemini 2.0 Flash...');
+      
+      const validationPrompt = `Review and fix this recipe. CRITICAL RULES:
+1. ONLY use these exact ingredients: ${ingredients.join(', ')}
+2. Remove ANY ingredients not in the list above
+3. Fix unrealistic quantities
+4. Ensure instructions are clear and logical
+5. Add proper measurements to all ingredients
+6. Include nutrition info: calories, protein, carbs, fat, fiber
+
+Current recipe:
+${JSON.stringify(initialRecipe, null, 2)}
+
+Return ONLY the corrected recipe as a valid JSON object with all required fields.`;
+      
+      const stage2Response = await axios.post(
+        `${GEMINI_20_FLASH_URL}?key=${GEMINI_API_KEY}`,
+        {
+          contents: [{
+            parts: [{
+              text: validationPrompt
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.3, // Lower temperature for accuracy
+            topK: 1,
+            topP: 1,
+            maxOutputTokens: 1024,
+          },
+          safetySettings: [
+            {
+              category: "HARM_CATEGORY_HARASSMENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_HATE_SPEECH",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            },
+            {
+              category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+              threshold: "BLOCK_MEDIUM_AND_ABOVE"
+            }
+          ]
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000 // 15 second timeout for stage 2
+        }
+      );
+      
+      // Extract the corrected recipe
+      if (stage2Response.data && stage2Response.data.candidates && stage2Response.data.candidates[0]) {
+        const correctedText = stage2Response.data.candidates[0].content.parts[0].text;
+        
+        try {
+          const cleanedText = correctedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+          const finalRecipe = JSON.parse(cleanedText);
+          
+          // Ensure nutrition info exists
+          if (!finalRecipe.nutrition) {
+            finalRecipe.nutrition = {
+              calories: 350,
+              protein: "25g",
+              carbs: "40g",
+              fat: "12g",
+              fiber: "5g"
+            };
+          }
+          
+          // Log successful generation
+          console.log(`Recipe generated successfully with 2-stage process for device: ${deviceId}`);
+          
+          res.json({ 
+            success: true, 
+            recipe: finalRecipe,
+            source: 'gemini-2stage'
+          });
+        } catch (parseError) {
+          // If stage 2 parsing fails, use stage 1 result
+          console.error('Stage 2 parse error, using stage 1 result:', parseError);
+          res.json({ 
+            success: true, 
+            recipe: initialRecipe,
+            source: 'gemini-stage1'
+          });
+        }
+      } else {
+        // If stage 2 fails completely, use stage 1 result
+        console.log('Stage 2 failed, using stage 1 result');
+        res.json({ 
+          success: true, 
+          recipe: initialRecipe,
+          source: 'gemini-stage1'
+        });
+      }
+      
+    } catch (apiError) {
+      console.error('Recipe generation error:', apiError.response?.data || apiError.message);
+      
+      // Don't expose the actual error to the client
+      res.status(500).json({ 
+        error: 'Failed to generate recipe. Please try again.',
+        source: 'gemini'
+      });
+    }
+    
+  } catch (error) {
+    console.error('Recipe generation error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Save or update user rating for a recipe
+app.post('/api/user-rating', async (req, res) => {
+  try {
+    const { recipeId, deviceId, rating, recipeTitle } = req.body;
+    
+    if (!recipeId || !deviceId || !rating) {
+      return res.status(400).json({ error: 'Recipe ID, device ID, and rating are required' });
+    }
+    
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+    }
+    
+    // For community recipes (numeric IDs), save to recipe_views
+    if (!isNaN(recipeId)) {
+      const query = `
+        INSERT INTO recipe_views (recipe_id, device_id, rating, viewed_at)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+        ON CONFLICT (recipe_id, device_id) 
+        DO UPDATE SET rating = $3, viewed_at = CURRENT_TIMESTAMP
+        RETURNING *
+      `;
+      
+      const result = await pool.query(query, [recipeId, deviceId, rating]);
+      console.log(`User ${deviceId} rated recipe ${recipeId} with ${rating} stars`);
+      res.json({ success: true, rating: result.rows[0] });
+    } else {
+      // For AI-generated recipes, we'll store them in a separate table or just return success
+      console.log(`User ${deviceId} rated AI recipe "${recipeTitle}" with ${rating} stars`);
+      res.json({ success: true, message: 'Rating saved locally' });
+    }
+    
+  } catch (error) {
+    console.error('Error saving user rating:', error);
+    res.status(500).json({ error: 'Failed to save rating' });
+  }
+});
+
+// Get user's rating for a specific recipe
+app.get('/api/user-rating/:recipeId/:deviceId', async (req, res) => {
+  try {
+    const { recipeId, deviceId } = req.params;
+    
+    // Only check database for numeric recipe IDs (community recipes)
+    if (isNaN(recipeId)) {
+      return res.json({ rating: null });
+    }
+    
+    const query = `
+      SELECT rating FROM recipe_views 
+      WHERE recipe_id = $1 AND device_id = $2
+    `;
+    
+    const result = await pool.query(query, [recipeId, deviceId]);
+    
+    if (result.rows.length > 0 && result.rows[0].rating) {
+      res.json({ rating: result.rows[0].rating });
+    } else {
+      res.json({ rating: null });
+    }
+    
+  } catch (error) {
+    console.error('Error fetching user rating:', error);
+    res.status(500).json({ error: 'Failed to fetch rating' });
+  }
+});
+
+// Get user's ratings for multiple recipes
+app.post('/api/user-ratings', async (req, res) => {
+  try {
+    const { recipeIds, deviceId } = req.body;
+    
+    if (!recipeIds || !deviceId || !Array.isArray(recipeIds)) {
+      return res.status(400).json({ error: 'Recipe IDs array and device ID are required' });
+    }
+    
+    // Filter only numeric IDs (community recipes)
+    const numericIds = recipeIds.filter(id => !isNaN(id));
+    
+    if (numericIds.length === 0) {
+      return res.json({ ratings: {} });
+    }
+    
+    const query = `
+      SELECT recipe_id, rating 
+      FROM recipe_views 
+      WHERE recipe_id = ANY($1) AND device_id = $2 AND rating IS NOT NULL
+    `;
+    
+    const result = await pool.query(query, [numericIds, deviceId]);
+    
+    // Convert to object for easy lookup
+    const ratings = {};
+    result.rows.forEach(row => {
+      ratings[row.recipe_id] = row.rating;
+    });
+    
+    res.json({ ratings });
+    
+  } catch (error) {
+    console.error('Error fetching user ratings:', error);
+    res.status(500).json({ error: 'Failed to fetch ratings' });
   }
 });
 
