@@ -11,6 +11,20 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Spice pack definitions (must match client)
+const spicePackDefinitions = {
+  basic: 'salt and pepper',
+  italian: 'basil, oregano, thyme, rosemary, garlic powder',
+  mexican: 'cumin, chili powder, paprika, cayenne pepper, oregano, garlic powder',
+  indian: 'turmeric, cumin, coriander, garam masala, cardamom, mustard seeds',
+  chinese: 'soy sauce, ginger, garlic, sesame oil, five-spice powder, white pepper',
+  bbq: 'paprika, brown sugar, garlic powder, onion powder, cayenne, black pepper',
+  baking: 'all-purpose flour, butter, sugar, baking powder, baking soda, vanilla extract, eggs, milk',
+  oils: 'olive oil, vegetable oil, coconut oil, sesame oil, balsamic vinegar, apple cider vinegar, rice vinegar',
+  condiments: 'ketchup, mustard, mayonnaise, hot sauce, honey, maple syrup, worcestershire sauce, ranch dressing',
+  mediterranean: 'lemon juice, feta cheese, olives, sun-dried tomatoes, za\'atar, sumac, mint, dill'
+};
+
 // Fix DATABASE_URL if it contains newlines or spaces
 let DATABASE_URL = process.env.DATABASE_URL || '';
 
@@ -247,7 +261,7 @@ app.get('/db-health', async (req, res) => {
 // Recipe matching endpoint
 app.post('/api/recipes/match', async (req, res) => {
   try {
-    const { ingredients, dietary, cuisine, deviceId } = req.body;
+    const { ingredients, dietary, cuisine, spicePacks, deviceId } = req.body;
     
     if (!ingredients || !Array.isArray(ingredients) || ingredients.length === 0) {
       return res.status(400).json({ error: 'Ingredients array required' });
@@ -390,14 +404,29 @@ app.post('/api/recipes/match', async (req, res) => {
         // Stage 1: Generate initial recipe with Gemini 1.5 Flash
         console.log('Stage 1: Generating initial recipe with Gemini 1.5 Flash...');
         
-        const simplePrompt = `Create a ${cuisine || 'delicious'} recipe using ONLY these ingredients: ${ingredients.join(', ')}. 
+        // Get available spices from selected packs
+        const activeSpicePacks = spicePacks || ['basic'];
+        const availableSpices = activeSpicePacks.map(pack => spicePackDefinitions[pack]).filter(Boolean).join(', ');
+        
+        const simplePrompt = `Create a ${cuisine || 'delicious'} recipe.
+        
+        MAIN INGREDIENTS PROVIDED: ${ingredients.join(', ')}
+        
+        ADDITIONAL AVAILABLE INGREDIENTS from pantry/spice packs: ${availableSpices}
+        
         ${dietary ? `Dietary restriction: ${dietary}.` : ''}
-        Available seasonings: salt, pepper, common spices.
+        
+        RECIPE CREATION RULES:
+        1. You MUST use the main ingredients provided
+        2. You CAN and SHOULD use items from the pantry/spice packs to enhance the recipe
+        3. Create a flavorful, well-seasoned dish using appropriate seasonings and cooking ingredients
+        4. If oils are available, use them for cooking. If vinegars are available, use them for flavor
+        5. DO NOT add ingredients that aren't in either the main list OR the pantry list
         
         Return a JSON object with these fields:
         - title: Recipe name
         - description: One sentence description
-        - ingredients: Array of ingredient strings in format "amount unit ingredient" (e.g., "2 cups rice", "1 lb chicken")
+        - ingredients: Array of ingredient strings in format "amount unit ingredient" (e.g., "2 cups rice", "1 lb beef", "2 tbsp olive oil")
         - instructions: Array of instruction strings
         - prepTime: String like "20 minutes"
         - cookTime: String like "30 minutes"
@@ -483,13 +512,14 @@ app.post('/api/recipes/match', async (req, res) => {
         console.log('Stage 2: Reviewing and correcting with Gemini 2.0 Flash...');
         
         const validationPrompt = `Review and fix this recipe. CRITICAL RULES:
-1. ONLY use these exact ingredients: ${ingredients.join(', ')}
-2. Remove ANY ingredients not in the list above
-3. Fix unrealistic quantities
-4. Ensure instructions are clear and logical
-5. Add proper measurements to all ingredients
-6. Include nutrition info: calories, protein, carbs, fat, fiber
-7. Ensure all fields are present: title, description, ingredients, instructions, prepTime, cookTime, servings, difficulty, cuisine, nutrition
+1. Main ingredients that MUST be used: ${ingredients.join(', ')}
+2. Additional pantry ingredients that CAN be used: ${availableSpices}
+3. Remove ANY ingredients not in either list above
+4. Fix unrealistic quantities
+5. Ensure instructions are clear and logical
+6. Add proper measurements to all ingredients
+7. Include nutrition info: calories, protein, carbs, fat, fiber
+8. Ensure all fields are present: title, description, ingredients, instructions, prepTime, cookTime, servings, difficulty, cuisine, nutrition
 
 Current recipe:
 ${JSON.stringify(initialRecipe, null, 2)}
