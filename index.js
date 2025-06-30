@@ -393,7 +393,20 @@ app.post('/api/recipes/match', async (req, res) => {
         const simplePrompt = `Create a ${cuisine || 'delicious'} recipe using ONLY these ingredients: ${ingredients.join(', ')}. 
         ${dietary ? `Dietary restriction: ${dietary}.` : ''}
         Available seasonings: salt, pepper, common spices.
-        Return a JSON object with: title, description, ingredients (with amounts), instructions (array), prepTime, cookTime, servings, difficulty, cuisine, nutrition (calories, protein, carbs, fat, fiber).`;
+        
+        Return a JSON object with these fields:
+        - title: Recipe name
+        - description: One sentence description
+        - ingredients: Array of ingredient strings in format "amount unit ingredient" (e.g., "2 cups rice", "1 lb chicken")
+        - instructions: Array of instruction strings
+        - prepTime: String like "20 minutes"
+        - cookTime: String like "30 minutes"
+        - servings: Number or string
+        - difficulty: "easy", "medium", or "hard"
+        - cuisine: Type of cuisine
+        - nutrition: Object with calories, protein, carbs, fat, fiber
+        
+        IMPORTANT: Each ingredient must be a simple string, NOT an object.`;
         
         const stage1Response = await axios.post(
           `${GEMINI_15_FLASH_URL}?key=${GEMINI_API_KEY}`,
@@ -547,6 +560,36 @@ Return ONLY the corrected recipe as a valid JSON object with all required fields
           } catch (parseError) {
             console.error('Stage 2 parse error, using stage 1 result:', parseError);
           }
+        }
+        
+        // Ensure ingredients are properly formatted before sending
+        if (finalRecipe.ingredients && Array.isArray(finalRecipe.ingredients)) {
+          finalRecipe.ingredients = finalRecipe.ingredients.map(ing => {
+            if (typeof ing === 'string') {
+              return ing;
+            } else if (typeof ing === 'object' && ing !== null) {
+              // Extract ingredient parts
+              const amount = ing.amount || ing.quantity || '';
+              const unit = ing.unit || ing.measurement || '';
+              const name = ing.name || ing.ingredient || ing.item || ing.food || '';
+              
+              // If no name found, log error and try to extract from any other property
+              if (!name) {
+                console.error('AI generated ingredient missing name:', ing);
+                // Try to find any string property that might be the name
+                for (const key in ing) {
+                  if (typeof ing[key] === 'string' && !['amount', 'unit', 'quantity', 'measurement'].includes(key)) {
+                    return `${amount} ${unit} ${ing[key]}`.trim();
+                  }
+                }
+                // Last resort: return the whole object as string
+                return JSON.stringify(ing);
+              }
+              
+              return `${amount} ${unit} ${name}`.trim();
+            }
+            return String(ing);
+          });
         }
         
         // Return the generated recipe in the same format as database recipes
