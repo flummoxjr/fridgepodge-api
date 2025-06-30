@@ -20,7 +20,7 @@ const spicePackDefinitions = {
   chinese: 'soy sauce, ginger, garlic, sesame oil, five-spice powder, white pepper',
   bbq: 'paprika, brown sugar, garlic powder, onion powder, cayenne, black pepper',
   baking: 'all-purpose flour, butter, sugar, baking powder, baking soda, vanilla extract, eggs, milk',
-  oils: 'olive oil, vegetable oil, coconut oil, sesame oil, balsamic vinegar, apple cider vinegar, rice vinegar',
+  oils: 'cooking oil, vinegar',
   condiments: 'ketchup, mustard, mayonnaise, hot sauce, honey, maple syrup, worcestershire sauce, ranch dressing',
   mediterranean: 'lemon juice, feta cheese, olives, sun-dried tomatoes, za\'atar, sumac, mint, dill'
 };
@@ -997,7 +997,7 @@ app.get('/api/recipes/most-saved', async (req, res) => {
 app.get('/api/recipes/top-community', async (req, res) => {
   try {
     // Query to get top 10 recipes based on average rating and number of ratings
-    // Only includes recipes that have been rated
+    // Includes ALL recipes that have been rated (not just community-submitted)
     const topRecipesResult = await pool.query(`
       SELECT 
         r.id,
@@ -1012,8 +1012,7 @@ app.get('/api/recipes/top-community', async (req, res) => {
         r.created_at
       FROM recipes r
       INNER JOIN recipe_views rv ON r.id = rv.recipe_id
-      WHERE r.submitted_by IS NOT NULL  -- Only community-submitted recipes
-        AND rv.rating IS NOT NULL      -- Only include rated recipes
+      WHERE rv.rating IS NOT NULL      -- Only include rated recipes
       GROUP BY r.id, r.title, r.servings, r.cuisine, r.prep_time, r.cook_time, r.created_at
       HAVING COUNT(DISTINCT rv.device_id) > 0  -- Must have at least one rating
       ORDER BY 
@@ -1683,20 +1682,45 @@ app.post('/api/user-rating', async (req, res) => {
     
     // For community recipes (numeric IDs), save to recipe_views
     if (!isNaN(recipeId)) {
-      const query = `
-        INSERT INTO recipe_views (recipe_id, device_id, rating, viewed_at)
-        VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-        ON CONFLICT (recipe_id, device_id) 
-        DO UPDATE SET rating = $3, viewed_at = CURRENT_TIMESTAMP
-        RETURNING *
-      `;
-      
-      const result = await pool.query(query, [recipeId, deviceId, rating]);
-      console.log(`User ${deviceId} rated recipe ${recipeId} with ${rating} stars`);
-      res.json({ success: true, rating: result.rows[0] });
+      try {
+        const query = `
+          INSERT INTO recipe_views (recipe_id, device_id, rating, viewed_at)
+          VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+          ON CONFLICT (recipe_id, device_id) 
+          DO UPDATE SET rating = $3, viewed_at = CURRENT_TIMESTAMP
+          RETURNING *
+        `;
+        
+        const result = await pool.query(query, [parseInt(recipeId), deviceId, rating]);
+        console.log(`User ${deviceId} rated recipe ${recipeId} with ${rating} stars`);
+        
+        // Update recipe statistics
+        const statsQuery = `
+          UPDATE recipes 
+          SET rating_count = (
+            SELECT COUNT(DISTINCT device_id) 
+            FROM recipe_views 
+            WHERE recipe_id = $1 AND rating IS NOT NULL
+          ),
+          average_rating = (
+            SELECT AVG(rating) 
+            FROM recipe_views 
+            WHERE recipe_id = $1 AND rating IS NOT NULL
+          )
+          WHERE id = $1
+        `;
+        await pool.query(statsQuery, [parseInt(recipeId)]);
+        
+        res.json({ success: true, rating: result.rows[0] });
+      } catch (error) {
+        console.error('Error saving rating for recipe:', error);
+        // If it fails, treat as AI-generated recipe
+        console.log(`User ${deviceId} rated AI recipe "${recipeTitle || recipeId}" with ${rating} stars`);
+        res.json({ success: true, message: 'Rating saved locally' });
+      }
     } else {
       // For AI-generated recipes, we'll store them in a separate table or just return success
-      console.log(`User ${deviceId} rated AI recipe "${recipeTitle}" with ${rating} stars`);
+      console.log(`User ${deviceId} rated AI recipe "${recipeTitle || recipeId}" with ${rating} stars`);
       res.json({ success: true, message: 'Rating saved locally' });
     }
     
